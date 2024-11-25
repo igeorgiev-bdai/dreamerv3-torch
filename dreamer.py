@@ -6,7 +6,7 @@ import sys
 from omegaconf import DictConfig, OmegaConf, open_dict
 from types import SimpleNamespace
 
-os.environ["MUJOCO_GL"] = "osmesa"
+# os.environ["MUJOCO_GL"] = "osmesa"
 
 import numpy as np
 from ruamel.yaml import YAML
@@ -24,6 +24,12 @@ from torch import nn
 from torch import distributions as torchd
 
 import collections
+
+from IPython.core import ultratb
+import sys
+
+# For debugging
+sys.excepthook = ultratb.FormattedTB(mode="Plain", color_scheme="Neutral", call_pdb=1)
 
 
 to_np = lambda x: x.detach().cpu().numpy()
@@ -46,7 +52,9 @@ class Dreamer(nn.Module):
         self._step = logger.step // config.action_repeat
         self._update_count = 0
         self._dataset = dataset
-        self._wm = models.WorldModel(obs_space, act_space, self._step, config, config_env)
+        self._wm = models.WorldModel(
+            obs_space, act_space, self._step, config, config_env
+        )
         self._task_behavior = models.ImagBehavior(config, self._wm)
         if (
             config.compile and os.name != "nt"
@@ -63,11 +71,7 @@ class Dreamer(nn.Module):
     def __call__(self, obs, reset, state=None, training=True):
         step = self._step
         if training:
-            steps = (
-                self._config.pretrain
-                if self._should_pretrain()
-                else self._should_train(step)
-            )
+            steps = self._config.pretrain if self._should_pretrain() else 4
             for _ in range(steps):
                 self._train(next(self._dataset))
                 self._update_count += 1
@@ -94,8 +98,7 @@ class Dreamer(nn.Module):
             latent, action = state
         obs = self._wm.preprocess(obs)
         embed = self._wm.encoder(obs)
-        is_first = torch.zeros(self._config_env.config.num_envs, dtype=torch.int32) # TODO: figure out a way to not manually code this in
-        latent, _ = self._wm.dynamics.obs_step(latent, action, embed, is_first)
+        latent, _ = self._wm.dynamics.obs_step(latent, action, embed, obs["is_first"])
         if self._config.eval_state_mean:
             latent["stoch"] = latent["mean"]
         feat = self._wm.dynamics.get_feat(latent)
@@ -200,12 +203,12 @@ def make_env(config, config_env, mode, id):
         env = wrappers.OneHotAction(env)
     elif suite == "dflex":
         import envs.dflex as dflex
+
         print("Parsing config for dflex environment")
-        # pass in 
-        # output config
-        env = dflex.make_env(config, config_env) 
+        # pass in output config
+        env = dflex.make_env(config, config_env)
         print("Successfully created dflex environment")
-        return env # TODO do we need to wrap the environment?
+        return env  # TODO do we need to wrap the environment?
     else:
         raise NotImplementedError(suite)
     env = wrappers.TimeLimit(env, config.time_limit)
@@ -234,7 +237,7 @@ def main(config, config_env):
     config.evaldir.mkdir(parents=True, exist_ok=True)
     step = count_steps(config.traindir)
     # step in logger is environmental step
-    logger = tools.Logger(logdir, config.action_repeat * step, config)
+    logger = tools.Logger(logdir, 0, config)
 
     print("Create envs.")
     if config.offline_traindir:
@@ -242,18 +245,18 @@ def main(config, config_env):
     else:
         directory = config.traindir
     # train_eps = tools.load_episodes(directory, limit=config.dataset_size)
-    train_eps = collections.OrderedDict() # TODO: process info from .pkl files
+    train_eps = collections.OrderedDict()  # TODO: process info from .pkl files
     if config.offline_evaldir:
         directory = config.offline_evaldir.format(**vars(config))
     else:
         directory = config.evaldir
     # eval_eps = tools.load_episodes(directory, limit=1)
-    eval_eps = collections.OrderedDict() # TODO: process info from .pkl files
+    eval_eps = collections.OrderedDict()  # TODO: process info from .pkl files
     make = lambda mode, id: make_env(config, config_env, mode, id)
     # train_envs = [make("train", i) for i in range(config.envs)]
     # eval_envs = [make("eval", i) for i in range(config.envs)]
-    train_envs = [make("train", 0)] # since dflex anyways parallelizes it
-    eval_envs = [make("eval", 0)] # since dflex anyways parallelizes it
+    train_envs = [make("train", 0)]  # since dflex anyways parallelizes it
+    eval_envs = [make("eval", 0)]  # since dflex anyways parallelizes it
     # if config.parallel:
     #     train_envs = [Parallel(env, "process") for env in train_envs]
     #     eval_envs = [Parallel(env, "process") for env in eval_envs]
@@ -266,8 +269,11 @@ def main(config, config_env):
     config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
 
     state = None
-    if not config.offline_traindir:
+    # if not config.offline_traindir:
+    if True:
         prefill = max(0, config.prefill - count_steps(config.traindir))
+        prefill = 5000
+
         print(f"Prefill dataset ({prefill} steps).")
         if hasattr(acts, "discrete"):
             random_actor = tools.OneHotDist(
@@ -289,6 +295,7 @@ def main(config, config_env):
             logprob = random_actor.log_prob(action)
             return {"action": action, "logprob": logprob}, None
 
+        print(f"Prefilling with {prefill}")
         state = tools.simulate(
             random_agent,
             train_envs,
@@ -299,15 +306,17 @@ def main(config, config_env):
             steps=prefill,
             num_envs=config_env.config.num_envs,
         )
-        logger.step += prefill * config.action_repeat
+        logger.step += prefill
         print(f"Logger: ({logger.step} steps).")
 
     print("Simulate agent.")
     train_dataset = make_dataset(train_eps, config)
     eval_dataset = make_dataset(eval_eps, config)
+    print(f"obs {train_envs[0].num_obs}")
+    print(f"act {train_envs[0].num_acts}")
     agent = Dreamer(
-        train_envs[0].num_obs, # train_envs[0].observation_space, 
-        train_envs[0].num_acts, # train_envs[0].action_space, 
+        train_envs[0].num_obs,  # train_envs[0].observation_space,
+        train_envs[0].num_acts,  # train_envs[0].action_space,
         config,
         config_env,
         logger,
@@ -326,22 +335,23 @@ def main(config, config_env):
     print("Config steps", config.steps)
     while agent._step < config.steps + config.eval_every:
         logger.write()
-        if config.eval_episode_num > 0:
-            print("Start evaluation.")
-            eval_policy = functools.partial(agent, training=False)
-            tools.simulate(
-                eval_policy,
-                eval_envs,
-                eval_eps,
-                config.evaldir,
-                logger,
-                is_eval=True,
-                episodes=config.eval_episode_num,
-                num_envs=config_env.config.num_envs
-            )
-            if config.video_pred_log:
-                video_pred = agent._wm.video_pred(next(eval_dataset))
-                logger.video("eval_openl", to_np(video_pred))
+        # if config.eval_episode_num > 0:
+        #     print("Start evaluation.")
+        #     eval_policy = functools.partial(agent, training=False)
+        #     tools.simulate(
+        #         eval_policy,
+        #         eval_envs,
+        #         eval_eps,
+        #         config.evaldir,
+        #         logger,
+        #         is_eval=True,
+        #         episodes=config.eval_episode_num,
+        #         num_envs=config_env.config.num_envs,
+        #     )
+        #     if config.video_pred_log:
+        #         video_pred = agent._wm.video_pred(next(eval_dataset))
+        #         logger.video("eval_openl", to_np(video_pred))
+
         print("Start training.")
         state = tools.simulate(
             agent,
@@ -350,8 +360,9 @@ def main(config, config_env):
             config.traindir,
             logger,
             limit=config.dataset_size,
-            steps=config.eval_every,
+            steps=5000 * config_env.config.num_envs,
             state=state,
+            num_envs=config_env.config.num_envs,
         )
         items_to_save = {
             "agent_state_dict": agent.state_dict(),
@@ -370,9 +381,7 @@ if __name__ == "__main__":
     parser.add_argument("--configs", nargs="+")
     args, remaining = parser.parse_known_args()
     yaml = YAML()
-    configs = yaml.load(
-        (pathlib.Path(sys.argv[0]).parent / "configs.yaml").read_text()
-    )
+    configs = yaml.load((pathlib.Path(sys.argv[0]).parent / "configs.yaml").read_text())
 
     def recursive_update(base, update):
         for key, value in update.items():
@@ -390,10 +399,13 @@ if __name__ == "__main__":
         arg_type = tools.args_type(value)
         parser.add_argument(f"--{key}", type=arg_type, default=arg_type(value))
 
+    parsed = parser.parse_args(remaining)
+    parsed.logdir = f"./logdir/{parsed.task}_{parsed.seed}/"
+
     # for dflex tasks
-    fp_env = os.path.join(os.getcwd(), 'envs', 'config', 'dflex_ant.yaml')
+    fp_env = os.path.join(os.getcwd(), "envs", "config", f"{parsed.task}.yaml")
     config_env = OmegaConf.load(fp_env)
     if not isinstance(config_env, DictConfig):
         config_env = OmegaConf.create(config_env)
-    
-    main(parser.parse_args(remaining), config_env)
+
+    main(parsed, config_env)

@@ -33,7 +33,7 @@ class WorldModel(nn.Module):
         self._use_amp = True if config.precision == 16 else False
         self._config = config
         # shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
-        shapes = {'obs': (obs_space, config_env.config.num_envs)}
+        shapes = {"obs": (obs_space, config_env.config.num_envs)}
         self.encoder = networks.MultiEncoder(shapes, **config.encoder)
         # print("Encoder input shape:", self.encoder.input_shape)
         self.embed_size = self.encoder.outdim
@@ -174,10 +174,6 @@ class WorldModel(nn.Module):
 
     # this function is called during both rollout and training
     def preprocess(self, obs):
-        # obs = {
-        #     k: torch.tensor(v, device=self._config.device, dtype=torch.float32)
-        #     for k, v in obs.items()
-        # }
         obs = {
             k: torch.tensor(v, device=self._config.device, dtype=torch.float32)
             for k, v in obs.items()
@@ -188,10 +184,10 @@ class WorldModel(nn.Module):
             # (batch_size, batch_length) -> (batch_size, batch_length, 1)
             obs["discount"] = obs["discount"].unsqueeze(-1)
         # 'is_first' is necesarry to initialize hidden state at training
-        # assert "is_first" in obs # TODO: I don't think I need this (?)
+        assert "is_first" in obs
         # 'is_terminal' is necesarry to train cont_head
-        # assert "is_terminal" in obs # TODO: I don't think I need this (?)
-        # obs["cont"] = (1.0 - obs["is_terminal"]).unsqueeze(-1)
+        assert "is_terminal" in obs  # TODO: I don't think I need this (?)
+        obs["cont"] = (1.0 - obs["is_terminal"]).unsqueeze(-1)
         return obs
 
     def video_pred(self, data):

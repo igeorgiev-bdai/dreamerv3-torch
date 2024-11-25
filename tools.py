@@ -16,9 +16,14 @@ from torch import nn
 from torch.nn import functional as F
 from torch import distributions as torchd
 from torch.utils.tensorboard import SummaryWriter
+from time import time
+from pwm.utils.average_meter import AverageMeter
 
 
 to_np = lambda x: x.detach().cpu().numpy()
+
+episode_loss_meter = AverageMeter(1, 100).to("cuda")
+episode_length_meter = AverageMeter(1, 100).to("cuda")
 
 
 def symlog(x):
@@ -68,14 +73,14 @@ class Logger:
 
         # Initialize wandb
         wandb.init(
-			project=config.wandb_project,
-			entity=config.wandb_entity,
-			name=config.run_descriptor,
-			# group=self._group,
-			# tags=cfg_to_group(cfg, return_list=True) + [f"seed:{cfg.seed}"],
-			# dir=self._log_dir,
-			# config=OmegaConf.to_container(cfg, resolve=True),
-		)
+            project=config.wandb_project,
+            entity=config.wandb_entity,
+            name=f"{config.task}_{config.seed}",
+            # group=self._group,
+            # tags=cfg_to_group(cfg, return_list=True) + [f"seed:{cfg.seed}"],
+            # dir=self._log_dir,
+            # config=OmegaConf.to_container(cfg, resolve=True),
+        )
         wandb.config.update({"step": step})
 
     def scalar(self, name, value):
@@ -96,12 +101,8 @@ class Logger:
         print(f"[{step}]", " / ".join(f"{k} {v:.1f}" for k, v in scalars))
         with (self._logdir / "metrics.jsonl").open("a") as f:
             f.write(json.dumps({"step": step, **dict(scalars)}) + "\n")
-        for name, value in scalars:
-            if "/" not in name:
-                self._writer.add_scalar("scalars/" + name, value, step)
-            else:
-                self._writer.add_scalar(name, value, step)
-                wandb.log({name: value}, step=step)
+        for name, value in self._scalars.items():
+            wandb.log({name: value}, step=step)
         for name, value in self._images.items():
             self._writer.add_image(name, value, step)
             wandb.log({name: [wandb.Image(value)]}, step=step)
@@ -121,11 +122,11 @@ class Logger:
 
     def _compute_fps(self, step):
         if self._last_step is None:
-            self._last_time = time.time()
+            self._last_time = time()
             self._last_step = step
             return 0
         steps = step - self._last_step
-        duration = time.time() - self._last_time
+        duration = time() - self._last_time
         self._last_time += duration
         self._last_step = step
         return steps / duration
@@ -142,7 +143,9 @@ class Logger:
         self._writer.add_video(name, value, step, 16)
         wandb.log({name: wandb.Video(value, fps=16, format="mp4")}, step=step)
 
+
 # use agent.train() and train in pwm/algo/pwm.py
+# TODO need to get this working with dflex correctly
 def simulate(
     agent,
     envs,
@@ -154,128 +157,129 @@ def simulate(
     steps=0,
     episodes=0,
     state=None,
-    num_envs=None, # change to config_env from dflex if we need to use more config params downstream
+    num_envs=None,  # change to config_env from dflex if we need to use more config params downstream
 ):
-    # initialize or unpack simulation state
+    env = envs[0]
     if state is None:
         step, episode = 0, 0
-        # done = np.ones(len(envs), bool)
         done = np.ones(num_envs, bool)
-        # length = np.zeros(len(envs), np.int32)
         length = np.zeros(num_envs, np.int32)
-        # obs = [None] * len(envs)
+
         obs = [None] * num_envs
         agent_state = None
-        # reward = [0] * len(envs)
         reward = [0] * num_envs
     else:
         step, episode, done, length, obs, agent_state, reward = state
-    
+
+    length = torch.zeros(num_envs, dtype=torch.int32).to("cuda")
+    ep_rewards = torch.zeros(num_envs).to("cuda")
+
+    obs = env.reset()
+    obs = obs.detach().cpu().numpy()
+    new_obs = []
+    for i in range(num_envs):
+        new_obs.append(
+            dict(obs=obs[i], is_first=np.array(True), is_terminal=np.array(False))
+        )
+    obs = new_obs
+
+    print("Calling fucking breakpoint!")
+
     while (steps and step < steps) or (episodes and episode < episodes):
-        print_status_bar(episode, episodes, step, steps)
-        # reset envs if necessary
+        print(f"Step {step}/{steps} | Episode {episode}/{episodes}", end="\r")
+
+        # now = time()
+
         if done.any():
-            env = envs[0]
-            results = env.reset()
-            for i in range(num_envs): # TODO: only iterate through the envs that are done
-                transition = {
-                    'obs': results[i].detach().cpu().numpy(),
-                    'reward': np.array(0.0),
-                    'done': np.array(True)
-                }
+
+            for i in done.nonzero()[0]:
+                transition = {k: convert(v) for k, v in obs[i].items()}
+                transition["reward"] = 0.0
+                transition["discount"] = 1.0
                 add_to_cache(cache, i, transition)
-        
-        if all(x is None for x in obs):
-            obs = [{'obs': results[i].detach().cpu().numpy(), 'reward': 0.0, 'discount': 1.0} for i in range(num_envs)]
-        else:
-            obs = [{'obs': obs[i], 'reward': 0.0, 'discount': 1.0} for i in range(num_envs)]
+
+        # print(f"Done caching took {time() - now:.4f}s")
+
+        # stack all observations into a single shape for the agent
+        # now = time()
         obs = {k: np.stack([o[k] for o in obs]) for k in obs[0] if "log_" not in k}
+        # print(f"Stacking took {time() - now:.4f}s")
+        # now = time()
+        action, agent_state = agent(obs, done, agent_state)
+        # print(f"Agent took {time() - now:.4f}s")
+        # now = time()
+        obs, reward, done, extra = env.step(action["action"].to(device="cuda"))
+        # print(f"Env step took {time() - now:.4f}s")
 
-        action, agent_state = agent(obs, done, agent_state)
-        # if isinstance(action, dict):
-        #     action = [
-        #         {k: np.array(action[k][i].detach().cpu()) for k in action}
-        #         for i in range(len(envs))
-        #     ]
-        # else:
-        #     action = np.array(action)
-        # print the shapes of obs, done, and agent_state in one line
-        action, agent_state = agent(obs, done, agent_state)
-        # if isinstance(action, dict):
-        #     action = [
-        #         {k: np.array(action[k][i].detach().cpu()) for k in action}
-        #         for i in range(len(envs))
-        #     ]
-        # else:
-        #     action = np.array(action)
-        # assert len(action) == len(envs)
-        # step envs
-        # results = [e.step(a) for e, a in zip(envs, action)]
-        # results = [r() for r in results]
-        results = env.step(action['action'].to(device="cuda"))
-        # obs, reward, done = zip(*[p[:3] for p in results])
-        obs, reward, done, extras = results
+        # convert obs into format they wany
+        now = time()
         obs = obs.detach().cpu().numpy()
-        # obs = list(obs)
-        # reward = list(reward)
-        # done = np.stack(done)
-        # episode += int(done.sum())
-        # length += 1
-        # step += len(envs)
-        # length *= 1 - done
-        # # add to cache
-        # for a, result, env in zip(action, results, envs):
-        #     o, r, d, info = result
-        #     o = {k: convert(v) for k, v in o.items()}
-        #     transition = o.copy()
-        #     if isinstance(a, dict):
-        #         transition.update(a)
-        #     else:
-        #         transition["action"] = a
-        #     transition["reward"] = r
-        #     transition["discount"] = info.get("discount", np.array(1 - float(d)))
-        #     add_to_cache(cache, env.id, transition)
-
-        # Iterate over each environment
+        new_obs = []
         for i in range(num_envs):
-            transition = {
-                'obs': obs[i],
-                'action': action['action'][i].detach().cpu().numpy(),
-                'reward': reward[i].detach().cpu().numpy(),
-                'done': done[i].detach().cpu().numpy()
-            }
-            
-            # Dynamically add keys from extras to the transition entry
-            for key in extras.keys():
-                transition[key] = extras[key][i].detach().cpu().numpy()
-            
+            new_obs.append(
+                dict(
+                    obs=obs[i],
+                    is_first=np.array(False),
+                    is_terminal=extra["termination"][i].cpu().detach().numpy(),
+                )
+            )
+        obs = new_obs
+        # print(f"Converting obs took {time() - now:.4f}s")
+
+        # this observation here is really just for storage
+        # now = time()
+        obs_to_store = extra["obs_before_reset"].detach().cpu().numpy()
+        new_obs = []
+        for i in range(num_envs):
+            new_obs.append(
+                dict(
+                    obs=obs_to_store[i],
+                    is_first=np.array(False),
+                    is_terminal=extra["termination"][i].cpu().detach().numpy(),
+                )
+            )
+        obs_to_store = new_obs
+        # print(f"Converting obs to store took {time() - now:.4f}s")
+
+        episode += int(done.sum())
+        step += num_envs
+        length += 1
+        ep_rewards += reward
+
+        # add to cache; iterate over each environment and add to cache
+        # now = time()
+        for i in range(num_envs):
+            transition = {k: convert(v) for k, v in obs_to_store[i].items()}
+            transition["action"] = action["action"][i].detach().cpu().numpy()
+            transition["reward"] = reward[i].detach().cpu().numpy()
+            transition["done"] = done[i].detach().cpu().numpy()
+            transition["discount"] = 1.0  # TODO not sure about this
             add_to_cache(cache, i, transition)
+        # print(f"Adding to cache took {time() - now:.4f}s")
+
+        # this loop is really logging for done episodes
         if done.any():
-            indices = [index for index, d in enumerate(done) if d]
+            # print("Logging for done episodes")
             # logging for done episode
-            for i in indices:
-                save_episodes(directory, {i: cache[i]}) # TODO: figure out the whole env id thing
-                
-                length = len(cache[i]["reward"]) - 1
-                score = float(np.array(cache[i]["reward"]).sum())
-                # video = cache[i]["image"]
-                # record logs given from environments
-                for key in list(cache[i].keys()):
-                    if "log_" in key:
-                        logger.scalar(
-                            key, float(np.array(cache[i][key]).sum())
-                        )
-                        # log items won't be used later
-                        cache[i].pop(key)
+            done_ids = done.nonzero(as_tuple=True)[0]
+            episode_loss_meter.update(ep_rewards[done_ids])
+            episode_length_meter.update(length[done_ids])
+
+            for i in done.nonzero(as_tuple=True)[0]:
+                # print(f"Logging for episode {i}")
+                # length = len(cache[i.item()]["reward"]) - 1
+                # score = float(np.array(cache[i.item()]["reward"]).sum())
+                # episode_loss_meter.update(score)
 
                 if not is_eval:
                     # TODO: logger isn't accurate, adapt to dflex tasks
                     step_in_dataset = erase_over_episodes(cache, limit)
-                    logger.scalar(f"dataset_size", step_in_dataset)
-                    logger.scalar(f"train_return", score)
-                    logger.scalar(f"train_length", length)
-                    logger.scalar(f"train_episodes", len(cache))
-                    logger.write(step=logger.step)
+                    # logger.scalar(f"dataset_size", step_in_dataset)
+                    # logger.scalar(f"train_return", score)
+                    # logger.scalar(f"train_length", length)
+                    # logger.scalar(f"train_episodes", len(cache))
+                    # logger.write(step=logger.step)
+                    # TODO IG: need to add logging for rewards to wandb here
                 else:
                     if not "eval_lengths" in locals():
                         eval_lengths = []
@@ -295,6 +299,13 @@ def simulate(
                         logger.scalar(f"eval_episodes", len(eval_scores))
                         logger.write(step=logger.step)
                         eval_done = True
+
+            logger.scalar(f"train_return", episode_loss_meter.get_mean())
+            logger.scalar(f"train_length", episode_length_meter.get_mean())
+            logger.write(step=logger.step)
+
+        length *= 1 - done.int()
+
     if is_eval:
         # keep only last item for saving memory. this cache is used for video_pred later
         while len(cache) > 1:
@@ -302,12 +313,17 @@ def simulate(
             cache.popitem(last=False)
     return (step - steps, episode - episodes, done, length, obs, agent_state, reward)
 
+
 def print_status_bar(episode, episodes, step, steps):
     bar_length = 30  # Length of the progress bar
     progress = step / steps if steps else 0
     filled_length = int(bar_length * progress)
-    bar = '=' * filled_length + '-' * (bar_length - filled_length)
-    print(f"\rEpisode {episode}/{episodes} | Step {step}/{steps} | [{bar}] {int(progress * 100)}%", end="")
+    bar = "=" * filled_length + "-" * (bar_length - filled_length)
+    print(
+        f"\rEpisode {episode}/{episodes} | Step {step}/{steps} | [{bar}] {int(progress * 100)}%",
+        end="",
+    )
+
 
 def add_to_cache(cache, id, transition):
     if id not in cache:
@@ -322,6 +338,7 @@ def add_to_cache(cache, id, transition):
                 cache[id][key].append(convert(val))
             else:
                 cache[id][key].append(convert(val))
+
 
 def erase_over_episodes(cache, dataset_size):
     step_in_dataset = 0

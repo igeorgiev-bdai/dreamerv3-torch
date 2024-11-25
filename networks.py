@@ -316,7 +316,7 @@ class MultiEncoder(nn.Module):
             k: v for k, v in shapes.items() if len(v) == 3 and re.match(cnn_keys, k)
         }
         self.mlp_shapes = {
-            k: v
+            k: (v[0],)
             for k, v in shapes.items()
             if len(v) in (1, 2) and re.match(mlp_keys, k)
         }
@@ -331,8 +331,8 @@ class MultiEncoder(nn.Module):
             )
             self.outdim += self._cnn.outdim
         if self.mlp_shapes:
-            # input_size = sum([sum(v) for v in self.mlp_shapes.values()])
-            input_size = self.mlp_shapes['obs'][0]  # This will be 37
+            input_size = sum([sum(v) for v in self.mlp_shapes.values()])
+            # input_size = self.mlp_shapes["obs"][0]  # This will be 37
             print("input_size:", input_size)
             self._mlp = MLP(
                 input_size,
@@ -386,7 +386,7 @@ class MultiDecoder(nn.Module):
             k: v for k, v in shapes.items() if len(v) == 3 and re.match(cnn_keys, k)
         }
         self.mlp_shapes = {
-            k: v
+            k: (v[0],)
             for k, v in shapes.items()
             if len(v) in (1, 2) and re.match(mlp_keys, k)
         }

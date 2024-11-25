@@ -1,6 +1,7 @@
 import gym
 import numpy as np
-import deepmind_lab
+
+# import deepmind_lab
 
 
 class DeepMindLabyrinth(object):

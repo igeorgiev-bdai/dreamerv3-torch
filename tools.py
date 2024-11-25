@@ -265,6 +265,9 @@ def simulate(
             episode_loss_meter.update(ep_rewards[done_ids])
             episode_length_meter.update(length[done_ids])
 
+            ep_rewards[done_ids] = 0.0
+            length[done_ids] = 0
+
             for i in done.nonzero(as_tuple=True)[0]:
                 # print(f"Logging for episode {i}")
                 # length = len(cache[i.item()]["reward"]) - 1
@@ -304,7 +307,7 @@ def simulate(
             logger.scalar(f"train_length", episode_length_meter.get_mean())
             logger.write(step=logger.step)
 
-        length *= 1 - done.int()
+        # length *= 1 - done.int()
 
     if is_eval:
         # keep only last item for saving memory. this cache is used for video_pred later

@@ -209,6 +209,7 @@ def simulate(
         # print(f"Agent took {time() - now:.4f}s")
         # now = time()
         obs, reward, done, extra = env.step(action["action"].to(device="cuda"))
+        # print(done.nonzero(as_tuple=True)[0])
         # print(f"Env step took {time() - now:.4f}s")
 
         # convert obs into format they wany
@@ -228,7 +229,8 @@ def simulate(
 
         # this observation here is really just for storage
         # now = time()
-        obs_to_store = extra["obs_before_reset"].detach().cpu().numpy()
+        obs_to_store = torch.nan_to_num_(extra["obs_before_reset"])
+        obs_to_store = obs_to_store.detach().cpu().numpy()
         new_obs = []
         for i in range(num_envs):
             new_obs.append(
